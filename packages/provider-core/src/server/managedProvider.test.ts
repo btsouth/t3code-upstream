@@ -18,6 +18,7 @@ import { TestClock } from "effect/testing";
 
 import { ProviderHost, type ProviderHostShape } from "./ProviderHost.ts";
 import { makeManagedServerProvider } from "./managedProvider.ts";
+import { ProviderProbeTimeoutError } from "./snapshotProbe.ts";
 
 const emptyCapabilities = createModelCapabilities({ optionDescriptors: [] });
 const fastModeCapabilities = createModelCapabilities({
@@ -89,6 +90,22 @@ const enrichedSnapshot: ServerProvider = {
     },
   ],
 };
+
+const missingCliSnapshot: ServerProvider = {
+  ...refreshedSnapshot,
+  installed: false,
+  version: null,
+  status: "error",
+  auth: { status: "unknown" },
+  message: "Codex CLI (`codex`) is not installed or not on PATH.",
+};
+
+const probeTimeout = new ProviderProbeTimeoutError({
+  provider: "Codex",
+  probe: "app-server status",
+  timeoutMs: 10_000,
+  installed: true,
+});
 
 const refreshedSnapshotSecond: ServerProvider = {
   ...refreshedSnapshot,
@@ -636,6 +653,191 @@ describe("makeManagedServerProvider", () => {
         const refreshed = yield* provider.refresh;
         assert.strictEqual(refreshed.message, refreshedSnapshotSecond.message);
         assert.deepStrictEqual(refreshed.usageLimits?.windows, [liveWindow]);
+      }),
+    ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
+  it.effect("keeps the last known status when a provider status probe times out", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const checkCalls = yield* Ref.make(0);
+        const releaseFirstCheck = yield* Deferred.make<void>();
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+            Effect.flatMap((count) =>
+              count === 1
+                ? Deferred.await(releaseFirstCheck).pipe(Effect.as(enrichedSnapshot))
+                : count === 2
+                  ? Effect.fail(probeTimeout)
+                  : Effect.succeed(refreshedSnapshotSecond),
+            ),
+          ),
+          refreshInterval: "1 hour",
+        });
+
+        const updatesFiber = yield* Stream.take(provider.streamChanges, 1).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseFirstCheck, undefined);
+        assert.deepStrictEqual(Array.from(yield* Fiber.join(updatesFiber)), [enrichedSnapshot]);
+
+        // Reporting an error would hide a working provider and write that error
+        // to the status cache, so everything the check established is carried
+        // forward. Only the timestamp and the message move.
+        const afterTimeout = yield* provider.refresh;
+
+        assert.strictEqual(yield* Ref.get(checkCalls), 2);
+        assert.strictEqual(afterTimeout.status, "ready");
+        assert.strictEqual(afterTimeout.installed, true);
+        assert.strictEqual(afterTimeout.version, enrichedSnapshot.version);
+        assert.deepStrictEqual(afterTimeout.auth, enrichedSnapshot.auth);
+        assert.deepStrictEqual(afterTimeout.models, enrichedSnapshot.models);
+        assert.deepStrictEqual(yield* provider.getSnapshot, afterTimeout);
+        assert.deepStrictEqual(yield* provider.refresh, refreshedSnapshotSecond);
+      }),
+    ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
+  it.effect("publishes a timeout so a manual refresh is never a silent no-op", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const releaseFirstCheck = yield* Deferred.make<void>();
+        const checkCalls = yield* Ref.make(0);
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+            Effect.flatMap((count) =>
+              count === 1
+                ? Deferred.await(releaseFirstCheck).pipe(Effect.as(refreshedSnapshot))
+                : Effect.fail(probeTimeout),
+            ),
+          ),
+          refreshInterval: "1 hour",
+        });
+
+        const updatesFiber = yield* Stream.take(provider.streamChanges, 2).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseFirstCheck, undefined);
+        yield* provider.refresh;
+
+        const updates = Array.from(yield* Fiber.join(updatesFiber));
+        assert.strictEqual(updates.length, 2);
+        // Second update carries the timeout, so clients and the status cache
+        // both learn the check was attempted and did not finish.
+        assert.notStrictEqual(updates[1]!.checkedAt, refreshedSnapshot.checkedAt);
+        assert.match(updates[1]!.message ?? "", /timed out after 10000ms/);
+      }),
+    ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
+  it.effect("does not let stale enrichment publish over a probe timeout", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const publishCallbacks: Array<(snapshot: ServerProvider) => Effect.Effect<void>> = [];
+        const enrichmentReady = yield* Deferred.make<void>();
+        const enrichmentStopped = yield* Deferred.make<void>();
+        const checkCalls = yield* Ref.make(0);
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+            Effect.flatMap((count) =>
+              count === 1 ? Effect.succeed(refreshedSnapshot) : Effect.fail(probeTimeout),
+            ),
+          ),
+          enrichSnapshot: ({ publishSnapshot }) =>
+            Effect.gen(function* () {
+              publishCallbacks.push(publishSnapshot);
+              yield* Deferred.succeed(enrichmentReady, undefined).pipe(Effect.ignore);
+              return yield* Effect.never;
+            }).pipe(Effect.ensuring(Deferred.succeed(enrichmentStopped, undefined))),
+          refreshInterval: "1 hour",
+        });
+
+        yield* Deferred.await(enrichmentReady);
+        const afterTimeout = yield* provider.refresh;
+
+        // Enrichment started against the pre-timeout snapshot. Publishing now
+        // would restore the old checkedAt and drop the timeout message, which
+        // is how a manual refresh became a silent no-op in the first place.
+        yield* Deferred.await(enrichmentStopped);
+        yield* publishCallbacks[0]!(enrichedSnapshot);
+
+        assert.deepStrictEqual(yield* provider.getSnapshot, afterTimeout);
+        assert.match(afterTimeout.message ?? "", /timed out after 10000ms/);
+      }),
+    ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
+  it.effect("does not carry a failed check forward as if it were a known good status", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const checkCalls = yield* Ref.make(0);
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+            Effect.flatMap((count) =>
+              count === 1 ? Effect.succeed(missingCliSnapshot) : Effect.fail(probeTimeout),
+            ),
+          ),
+          refreshInterval: "1 hour",
+        });
+
+        yield* Effect.yieldNow;
+        // The CLI was missing last time and may since have been installed. The
+        // timeout knows the probe got far enough to spawn, so keeping the old
+        // "not installed" verdict would be the more wrong of the two answers.
+        const afterTimeout = yield* provider.refresh;
+
+        assert.strictEqual(afterTimeout.installed, true);
+        assert.match(afterTimeout.message ?? "", /timed out after 10000ms/);
+        assert.notMatch(afterTimeout.message ?? "", /last known status/);
+      }),
+    ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
+  it.effect("reports the timeout plainly when no check has ever succeeded", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Effect.fail(probeTimeout),
+          refreshInterval: "1 hour",
+        });
+
+        // There is no known status to keep, and the pending placeholder claims
+        // the check has not run yet. Saying it timed out is the honest answer.
+        const afterTimeout = yield* provider.refresh;
+
+        assert.strictEqual(afterTimeout.status, "error");
+        assert.strictEqual(afterTimeout.installed, true);
+        assert.match(afterTimeout.message ?? "", /timed out after 10000ms/);
+        assert.notMatch(afterTimeout.message ?? "", /last known status/);
       }),
     ).pipe(Effect.provide(layerAlwaysRunTest)),
   );

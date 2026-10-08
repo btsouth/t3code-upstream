@@ -33,6 +33,7 @@ import {
   providerModelsFromSettings,
   spawnAndCollect,
   type ServerProviderDraft,
+  ProviderProbeTimeoutError,
 } from "@t3tools/provider-core/server/snapshotProbe";
 import { resolveClaudeSdkExecutablePath } from "./Drivers/ClaudeExecutable.ts";
 import { makeClaudeEnvironment } from "./Drivers/ClaudeHome.ts";
@@ -461,7 +462,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   resolveResetCredits?: (version: string) => Effect.Effect<ServerProviderResetCredits | undefined>,
 ): Effect.fn.Return<
   ServerProviderDraft,
-  never,
+  ProviderProbeTimeoutError,
   ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
 > {
   const resolvedEnvironment = environment ?? process.env;
@@ -517,19 +518,11 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   }
 
   if (Option.isNone(versionProbe.success)) {
-    return buildServerProvider({
-      presentation: CLAUDE_PRESENTATION,
-      enabled: claudeSettings.enabled,
-      checkedAt,
-      models: allModels,
-      probe: {
-        installed: true,
-        version: null,
-        status: "error",
-        auth: { status: "unknown" },
-        message:
-          "Claude Agent CLI is installed but failed to run. Timed out while running command.",
-      },
+    return yield* new ProviderProbeTimeoutError({
+      provider: "Claude Agent",
+      probe: "version",
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+      installed: true,
     });
   }
 

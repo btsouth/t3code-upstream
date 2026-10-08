@@ -4,10 +4,12 @@ import {
   ServerSettingsError,
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -17,6 +19,7 @@ import * as Semaphore from "effect/Semaphore";
 
 import { ProviderHost } from "./ProviderHost.ts";
 import { applyUsageLimitsUpdate, resolveUsageLimitsAfterProbe } from "./usageLimits.ts";
+import { ProviderProbeTimeoutError } from "./snapshotProbe.ts";
 import type { ServerProviderShape } from "./snapshot.ts";
 
 interface ProviderSnapshotState {
@@ -43,7 +46,10 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   readonly streamSettings: Stream.Stream<Settings>;
   readonly haveSettingsChanged: (previous: Settings, next: Settings) => boolean;
   readonly initialSnapshot: (settings: Settings) => Effect.Effect<ServerProvider>;
-  readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
+  readonly checkProvider: Effect.Effect<
+    ServerProvider,
+    ServerSettingsError | ProviderProbeTimeoutError
+  >;
   readonly enrichSnapshot?: (input: {
     readonly settings: Settings;
     readonly snapshot: ServerProvider;
@@ -67,6 +73,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     enrichmentGeneration: 0,
   });
   const settingsRef = yield* Ref.make(initialSettings);
+  const hasUsableStatus = yield* Ref.make(false);
   const enrichmentFiberRef = yield* Ref.make<Fiber.Fiber<void, unknown> | null>(null);
   const scope = yield* Effect.scope;
 
@@ -118,6 +125,42 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     yield* Ref.set(enrichmentFiberRef, fiber);
   });
 
+  // A deadline is not a verdict: keep usable status and publish the stale check.
+  const snapshotAfterProbeTimeout = Effect.fn("snapshotAfterProbeTimeout")(function* (
+    error: ProviderProbeTimeoutError,
+  ) {
+    const checkedAt = DateTime.formatIso(yield* DateTime.now);
+    const carryForward = yield* Ref.get(hasUsableStatus);
+    const next = yield* Ref.modify(snapshotStateRef, (state) => {
+      const snapshot: ServerProvider = carryForward
+        ? {
+            ...state.snapshot,
+            checkedAt,
+            message: `${error.message} Showing the last known status.`,
+          }
+        : {
+            ...state.snapshot,
+            checkedAt,
+            installed: error.installed,
+            version: error.version ?? state.snapshot.version,
+            status: "error",
+            message: error.message,
+          };
+      // Bumping the generation retires any enrichment still running against the
+      // superseded snapshot, so it cannot publish over this timeout later.
+      return [
+        snapshot,
+        { snapshot, enrichmentGeneration: state.enrichmentGeneration + 1 },
+      ] as const;
+    });
+    const staleEnrichment = yield* Ref.getAndSet(enrichmentFiberRef, null);
+    if (staleEnrichment) {
+      yield* Fiber.interrupt(staleEnrichment).pipe(Effect.ignore);
+    }
+    yield* PubSub.publish(changesPubSub, next);
+    return next;
+  });
+
   const applySnapshotBase = Effect.fn("applySnapshot")(function* (
     nextSettings: Settings,
     options?: { readonly forceRefresh?: boolean },
@@ -144,7 +187,32 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
       return state.snapshot;
     }
 
-    const probedSnapshot = yield* input.checkProvider;
+    const checked = yield* input.checkProvider.pipe(
+      // Only a status the UI can act on is worth protecting from a later
+      // timeout. A verdict of "broken" is not, or a provider that was missing
+      // when last checked would stay missing after it is installed.
+      Effect.tap((snapshot) => Ref.set(hasUsableStatus, snapshot.status !== "error")),
+      Effect.asSome,
+      Effect.catchTags({
+        ProviderProbeTimeoutError: (error) =>
+          Effect.logWarning("Provider status probe timed out.").pipe(
+            Effect.annotateLogs({
+              "provider.name": error.provider,
+              "provider.probe": error.probe,
+              "provider.probe.timeout_ms": error.timeoutMs,
+            }),
+            Effect.andThen(() => snapshotAfterProbeTimeout(error)),
+            Effect.as(Option.none<ServerProvider>()),
+          ),
+      }),
+    );
+    if (Option.isNone(checked)) {
+      // `settingsRef` deliberately stays on the previous value: these settings
+      // were never applied to a snapshot, so the next emission must still count
+      // as a change and re-probe rather than short-circuiting above.
+      return yield* Ref.get(snapshotStateRef).pipe(Effect.map((state) => state.snapshot));
+    }
+    const probedSnapshot = checked.value;
     const { snapshot: nextSnapshot, generation: nextGeneration } = yield* Ref.modify(
       snapshotStateRef,
       (state) => {

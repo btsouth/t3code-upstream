@@ -74,6 +74,33 @@ export class ProviderCommandNotFoundError extends Schema.TaggedError<ProviderCom
 
 const isProviderCommandNotFoundError = Schema.is(ProviderCommandNotFoundError);
 
+/**
+ * Raised when a provider status probe misses its deadline.
+ *
+ * A missed deadline does not establish that the provider is broken. Fail with
+ * this instead of reporting an `error` snapshot so the managed provider can
+ * keep the last known snapshot.
+ */
+export class ProviderProbeTimeoutError extends Schema.TaggedError<ProviderProbeTimeoutError>()(
+  "ProviderProbeTimeoutError",
+  {
+    provider: Schema.String,
+    probe: Schema.String,
+    timeoutMs: Schema.Number,
+    /**
+     * What the probe had established about the CLI before it ran out of time.
+     * Only consulted when there is no earlier status to fall back on, so the
+     * first-ever check still reports everything it did manage to learn.
+     */
+    installed: Schema.Boolean,
+    version: Schema.optionalKey(Schema.String),
+  },
+) {
+  override get message(): string {
+    return `${this.provider} ${this.probe} probe timed out after ${this.timeoutMs}ms.`;
+  }
+}
+
 export interface ProviderProbeResult {
   readonly installed: boolean;
   readonly version: string | null;

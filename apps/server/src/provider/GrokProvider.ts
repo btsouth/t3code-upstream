@@ -30,6 +30,7 @@ import {
   providerModelsFromSettings,
   spawnAndCollect,
   type ServerProviderDraft,
+  ProviderProbeTimeoutError,
 } from "@t3tools/provider-core/server/snapshotProbe";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
@@ -376,7 +377,7 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
   cwd?: string,
 ): Effect.fn.Return<
   ServerProviderDraft,
-  never,
+  ProviderProbeTimeoutError,
   ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto
 > {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
@@ -426,18 +427,11 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
   }
 
   if (Option.isNone(versionResult.success)) {
-    return buildServerProvider({
-      presentation: GROK_PRESENTATION,
-      enabled: grokSettings.enabled,
-      checkedAt,
-      models: fallbackModels,
-      probe: {
-        installed: true,
-        version: null,
-        status: "error",
-        auth: { status: "unknown" },
-        message: "Grok CLI is installed but timed out while running `grok --version`.",
-      },
+    return yield* new ProviderProbeTimeoutError({
+      provider: "Grok",
+      probe: "grok --version",
+      timeoutMs: VERSION_PROBE_TIMEOUT_MS,
+      installed: true,
     });
   }
 

@@ -1,6 +1,9 @@
 import type { SDKModel } from "@cursor/sdk";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import { TestClock } from "effect/testing";
 import * as Schema from "effect/Schema";
 import type { CursorSettings } from "@t3tools/contracts";
 import { CursorSettings as CursorSettingsSchema } from "@t3tools/contracts";
@@ -203,6 +206,39 @@ describe("checkCursorProviderStatus", () => {
           { slug: "internal/cursor-model", isCustom: true },
         ],
       });
+    }),
+  );
+
+  it.effect("reports a catalog deadline without declaring the provider broken", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const stopped = yield* Deferred.make<void>();
+      const statusFiber = yield* checkCursorProviderStatus(baseCursorSettings, {
+        CURSOR_API_KEY: "test-cursor-key",
+      }).pipe(
+        Effect.provide(
+          CursorSdkCatalog.layerTest(() =>
+            Deferred.succeed(started, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.ensuring(Deferred.succeed(stopped, undefined)),
+            ),
+          ),
+        ),
+        Effect.flip,
+        Effect.forkChild,
+      );
+
+      yield* Deferred.await(started);
+      yield* TestClock.adjust("15 seconds");
+      const timeout = yield* Fiber.join(statusFiber);
+      expect(timeout).toMatchObject({
+        _tag: "ProviderProbeTimeoutError",
+        provider: "Cursor",
+        probe: "SDK catalog",
+        timeoutMs: 15_000,
+        installed: true,
+      });
+      yield* Deferred.await(stopped);
     }),
   );
 

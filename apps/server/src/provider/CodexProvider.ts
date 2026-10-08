@@ -38,6 +38,7 @@ import {
   buildServerProvider,
   COMPACT_SLASH_COMMAND,
   type ServerProviderDraft,
+  ProviderProbeTimeoutError,
 } from "@t3tools/provider-core/server/snapshotProbe";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
@@ -584,7 +585,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
   managedAuth?: ServerProvider["auth"],
 ): Effect.fn.Return<
   ServerProviderDraft,
-  ServerSettingsError,
+  ServerSettingsError | ProviderProbeTimeoutError,
   ChildProcessSpawner.ChildProcessSpawner
 > {
   const resolvedEnvironment = environment ?? process.env;
@@ -647,19 +648,11 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
   }
 
   if (Option.isNone(probeResult.success)) {
-    return buildServerProvider({
-      presentation: CODEX_PRESENTATION,
-      enabled: codexSettings.enabled,
-      checkedAt,
-      models: emptyModels,
-      skills: [],
-      probe: {
-        installed: true,
-        version: null,
-        status: "error",
-        auth: { status: "unknown" },
-        message: "Timed out while checking Codex app-server provider status.",
-      },
+    return yield* new ProviderProbeTimeoutError({
+      provider: "Codex",
+      probe: "app-server status",
+      timeoutMs: AUTH_PROBE_TIMEOUT_MS,
+      installed: true,
     });
   }
 

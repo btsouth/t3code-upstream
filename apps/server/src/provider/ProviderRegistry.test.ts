@@ -12,6 +12,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
@@ -22,6 +23,7 @@ import {
   EnvironmentId,
   ClaudeSettings,
   CodexSettings,
+  GrokSettings,
   DEFAULT_SERVER_SETTINGS,
   PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS,
   ProviderDriverKind,
@@ -40,6 +42,7 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
 import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
+import { checkGrokProviderStatus } from "./GrokProvider.ts";
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as AntigravityInstallation from "./AntigravityInstallation.ts";
 import * as ModelManifest from "./ModelManifest.ts";
@@ -80,6 +83,7 @@ const disabledDefaultSlots = (
   );
 
 const defaultClaudeSettings: ClaudeSettings = Schema.decodeSync(ClaudeSettings)({});
+const defaultGrokSettings: GrokSettings = Schema.decodeSync(GrokSettings)({ enabled: true });
 const defaultCodexSettings: CodexSettings = Schema.decodeSync(CodexSettings)({});
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 const disabledCodexSettings: CodexSettings = Schema.decodeSync(CodexSettings)({
@@ -597,6 +601,7 @@ it.layer(
         const killCalls = yield* Ref.make(0);
         const statusFiber = yield* checkCodexProviderStatus(defaultCodexSettings).pipe(
           Effect.provide(layerHangingScopedSpawner(killCalls)),
+          Effect.result,
           Effect.forkChild,
         );
 
@@ -605,15 +610,43 @@ it.layer(
         yield* Effect.yieldNow;
 
         const status = yield* Fiber.join(statusFiber);
-        assert.strictEqual(status.status, "error");
+        assert.strictEqual(Result.isFailure(status), true);
         assert.strictEqual(
-          status.message,
-          "Timed out while checking Codex app-server provider status.",
+          Result.isFailure(status) ? status.failure._tag : null,
+          "ProviderProbeTimeoutError",
         );
         assert.strictEqual(yield* Ref.get(killCalls), 1);
       }),
     );
   });
+
+  it.effect.each(["Claude Agent", "Grok"] as const)(
+    "closes the %s version probe scope on timeout",
+    (provider) =>
+      Effect.gen(function* () {
+        const killCalls = yield* Ref.make(0);
+        const check = Effect.gen(function* () {
+          if (provider === "Grok") {
+            return yield* checkGrokProviderStatus(defaultGrokSettings);
+          }
+          return yield* checkClaudeProviderStatus(defaultClaudeSettings);
+        });
+        const statusFiber = yield* check.pipe(
+          Effect.provide(layerHangingScopedSpawner(killCalls)),
+          Effect.flip,
+          Effect.forkChild,
+        );
+
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("4 seconds");
+        const timeout = yield* Fiber.join(statusFiber);
+        assert.strictEqual(timeout._tag, "ProviderProbeTimeoutError");
+        assert.strictEqual(timeout.provider, provider);
+        assert.strictEqual(timeout.timeoutMs, 4_000);
+        assert.strictEqual(timeout.installed, true);
+        assert.strictEqual(yield* Ref.get(killCalls), 1);
+      }),
+  );
 
   describe("ProviderRegistry.layer", () => {
     it("stores workspace skills and commands without changing machine metadata", () => {

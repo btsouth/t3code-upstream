@@ -49,6 +49,18 @@ client connections and provider-instance rebuilds. Releases are immutable, with 
 selecting the version for new processes. Running processes hold leases on their version. Updates
 and removal must respect those leases instead of replacing executables under a running agent.
 
+## Status probe deadlines
+
+A missed status deadline does not establish that a provider is broken. Checks that would
+otherwise publish a failure verdict should raise
+[`ProviderProbeTimeoutError`](../../packages/provider-core/src/server/snapshotProbe.ts).
+The [managed provider](../../packages/provider-core/src/server/managedProvider.ts) carries
+forward the last usable status and marks the check stale. Publishing an error instead would
+persist that guess in the per-instance cache and hide a working provider after a restart.
+Before any usable check, report the timeout plainly; definite failures such as a missing
+executable or rejected credentials still replace the previous status. Metadata-only probes
+that already degrade without marking the provider broken can keep that behavior.
+
 ## Setup must not happen as a health-check side effect
 
 Opening a provider session can start MCP servers, run hooks, or launch a login browser.

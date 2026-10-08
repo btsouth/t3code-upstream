@@ -20,6 +20,7 @@ import {
   buildServerProvider,
   providerModelsFromSettings,
   type ServerProviderDraft,
+  ProviderProbeTimeoutError,
 } from "@t3tools/provider-core/server/snapshotProbe";
 import * as CursorSdkCatalog from "./CursorSdkCatalog.ts";
 
@@ -250,7 +251,11 @@ export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(
   cursorSettings: CursorSettings,
   environment?: NodeJS.ProcessEnv,
   authenticationType: "api-key" | "browser" = "api-key",
-): Effect.fn.Return<ServerProviderDraft, never, CursorSdkCatalog.CursorSdkCatalog> {
+): Effect.fn.Return<
+  ServerProviderDraft,
+  ProviderProbeTimeoutError,
+  CursorSdkCatalog.CursorSdkCatalog
+> {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const fallbackModels = getCursorFallbackModels(cursorSettings);
 
@@ -317,18 +322,11 @@ export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(
   }
 
   if (Option.isNone(catalogResult.success)) {
-    return buildServerProvider({
-      presentation: CURSOR_PRESENTATION,
-      enabled: cursorSettings.enabled,
-      checkedAt,
-      models: fallbackModels,
-      probe: {
-        installed: true,
-        version: null,
-        status: "error",
-        auth: { status: "unknown" },
-        message: `Cursor SDK catalog request timed out after ${CURSOR_SDK_CATALOG_TIMEOUT_MS}ms.`,
-      },
+    return yield* new ProviderProbeTimeoutError({
+      provider: "Cursor",
+      probe: "SDK catalog",
+      timeoutMs: CURSOR_SDK_CATALOG_TIMEOUT_MS,
+      installed: true,
     });
   }
 
